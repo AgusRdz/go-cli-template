@@ -1,0 +1,30 @@
+# Build output
+bin/
+
+# Go
+*.exe
+*.test
+*.out
+coverage.out
+
+# Environment
+.env
+.env.*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/settings.local.json
+
+# Signing (never commit private keys)
+private.pem
+*.pem
+!public_key.pem

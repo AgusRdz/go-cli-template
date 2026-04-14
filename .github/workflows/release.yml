@@ -1,0 +1,154 @@
+name: Release
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
+      - name: Run tests
+        run: go test ./... -count=1
+
+      - name: Validate semver tag
+        run: |
+          if ! echo "${{ github.ref_name }}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: tag '${{ github.ref_name }}' is not valid semver"
+            exit 1
+          fi
+
+      - name: Update CHANGELOG.md
+        uses: orhun/git-cliff-action@c93ef52f3d0ddcdcc9bd5447d98d458a11cd4f72  # v4
+        with:
+          config: cliff.toml
+          args: --output CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@c93ef52f3d0ddcdcc9bd5447d98d458a11cd4f72  # v4
+        id: changelog
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build binaries
+        run: |
+          VERSION=${{ github.ref_name }}
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o bin/mytool-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o bin/mytool-linux-arm64 .
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o bin/mytool-darwin-amd64 .
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o bin/mytool-darwin-arm64 .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o bin/mytool-windows-amd64.exe .
+
+      - name: Generate checksums
+        run: cd bin && sha256sum mytool-* > checksums.txt
+
+      - name: Sign checksums
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          echo "$SIGNING_KEY" | base64 -d > /tmp/signing.pem
+          openssl pkey -in /tmp/signing.pem -noout
+          openssl pkeyutl -sign -inkey /tmp/signing.pem -rawin -in bin/checksums.txt \
+            | xxd -p -c 256 | tr -d '\n' > bin/checksums.txt.sig
+          rm /tmp/signing.pem
+          [ -s bin/checksums.txt.sig ] || { echo "ERROR: checksums.txt.sig is empty — signing failed"; exit 1; }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.content }}
+          files: |
+            bin/mytool-linux-amd64
+            bin/mytool-linux-arm64
+            bin/mytool-darwin-amd64
+            bin/mytool-darwin-arm64
+            bin/mytool-windows-amd64.exe
+            bin/checksums.txt
+            bin/checksums.txt.sig
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: bin/mytool-*
+
+      - name: Update Homebrew formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          [ -z "${HOMEBREW_TAP_TOKEN}" ] && echo "HOMEBREW_TAP_TOKEN not set, skipping" && exit 0
+          VERSION=${{ github.ref_name }}
+          VER=${VERSION#v}
+          SHA_DARWIN_ARM64=$(sha256sum bin/mytool-darwin-arm64 | awk '{print $1}')
+          SHA_DARWIN_AMD64=$(sha256sum bin/mytool-darwin-amd64 | awk '{print $1}')
+          SHA_LINUX_AMD64=$(sha256sum bin/mytool-linux-amd64 | awk '{print $1}')
+          SHA_LINUX_ARM64=$(sha256sum bin/mytool-linux-arm64 | awk '{print $1}')
+          # TODO: update repo/tap references below
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/agusrdz/homebrew-tap.git tap
+          cat > tap/Formula/mytool.rb << FORMULA
+          class Mytool < Formula
+            desc "TODO: describe your tool here"
+            homepage "https://github.com/agusrdz/mytool"
+            version "${VER}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/agusrdz/mytool/releases/download/${VERSION}/mytool-darwin-arm64"
+                sha256 "${SHA_DARWIN_ARM64}"
+              else
+                url "https://github.com/agusrdz/mytool/releases/download/${VERSION}/mytool-darwin-amd64"
+                sha256 "${SHA_DARWIN_AMD64}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/agusrdz/mytool/releases/download/${VERSION}/mytool-linux-arm64"
+                sha256 "${SHA_LINUX_ARM64}"
+              else
+                url "https://github.com/agusrdz/mytool/releases/download/${VERSION}/mytool-linux-amd64"
+                sha256 "${SHA_LINUX_AMD64}"
+              end
+            end
+
+            def install
+              binary = Dir["mytool-*"].first
+              chmod 0755, binary
+              bin.install binary => "mytool"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/mytool --version")
+            end
+          end
+          FORMULA
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/mytool.rb
+          git commit -m "mytool ${VERSION}"
+          git push
