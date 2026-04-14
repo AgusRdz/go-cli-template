@@ -152,27 +152,6 @@ The script:
 
 ---
 
-## Claude Code Hook Integration
-
-`mytool init` registers a PostToolUse hook in `~/.claude/settings.json` that fires after every `Write` tool call. Implement your logic in `runHook()` in `main.go`.
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Write",
-        "hooks": [{ "type": "command", "command": "/path/to/mytool" }]
-      }
-    ]
-  }
-}
-```
-
-Use `mytool disable` / `mytool enable` to toggle globally without uninstalling. Use `mytool doctor` to diagnose hook issues.
-
----
-
 ## Configuration
 
 ### Global config
